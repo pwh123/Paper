@@ -11,17 +11,14 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      # 1. 检出代码（必须传入 token 以支持推送标签）
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      # 2. 设置 Java 环境
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -29,13 +26,11 @@ jobs:
           java-version: 21
           cache: gradle
 
-      # 3. 构建项目
       - name: Build fatJar
         run: |
           chmod +x gradlew
           ./gradlew clean fatJar --no-daemon
 
-      # 4. 创建并推送标签
       - name: Create and Push Tag
         run: |
           git config user.name "github-actions[bot]"
@@ -44,7 +39,6 @@ jobs:
           git tag "$TAG"
           git push origin "$TAG"
 
-      # 5. 发布到 GitHub Release（使用稳定替代方案）
       - name: Publish to GitHub Release
         uses: ncipollo/release-action@v1
         with:
