@@ -1,8 +1,9 @@
-name: Build in Fork
+name: Build and Release Server Jar
 
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,23 +15,41 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      # 1. 检出代码（必须传入 token 以支持推送标签）
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # ✅ 推送 tag 需要
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build JAR
-        run: ./gradlew clean fatJar
+      # 2. 设置 Java 环境
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
 
-      - name: Create Tag
+      # 3. 构建项目
+      - name: Build fatJar
         run: |
-          git tag "v1.0.${{ github.run_number }}"
-          git push origin "v1.0.${{ github.run_number }}"
+          chmod +x gradlew
+          ./gradlew clean fatJar --no-daemon
 
-      - name: Release to Fork
-        uses: softprops/action-gh-release@v2
+      # 4. 创建并推送标签
+      - name: Create and Push Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="v1.0.${{ github.run_number }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      # 5. 发布到 GitHub Release（使用稳定替代方案）
+      - name: Publish to GitHub Release
+        uses: ncipollo/release-action@v1
         with:
-          repository: ${{ github.repository }}  # ✅ 发布到 pwh123/Papep
-          tag_name: v1.0.${{ github.run_number }}
-          files: build/libs/server.jar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: v1.0.${{ github.run_number }}
+          name: Auto Build #${{ github.run_number }}
+          artifacts: build/libs/server.jar
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
