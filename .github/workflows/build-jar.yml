@@ -1,47 +1,36 @@
-name: Build and Release Server Jar
+name: Build in Fork
 
 on:
   push:
     branches: ["main"]
-  workflow_dispatch:
 
 permissions:
-  contents: write   # ✅ 必须允许发布 Release
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
         with:
-          distribution: temurin
-          java-version: 21
+          token: ${{ secrets.GITHUB_TOKEN }}  # ✅ 推送 tag 需要
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      - name: Build JAR
+        run: ./gradlew clean fatJar
 
-      - name: Build fatJar
-        run: ./gradlew clean fatJar --no-daemon
+      - name: Create Tag
+        run: |
+          git tag "v1.0.${{ github.run_number }}"
+          git push origin "v1.0.${{ github.run_number }}"
 
-      - name: List built files
-        run: ls -lh build/libs
-
-      - name: Upload artifact to Actions
-        uses: actions/upload-artifact@v4
-        with:
-          name: server-jar
-          path: build/libs/server.jar
-
-      - name: Publish to GitHub Release
+      - name: Release to Fork
         uses: softprops/action-gh-release@v2
         with:
+          repository: ${{ github.repository }}  # ✅ 发布到 pwh123/Papep
           tag_name: v1.0.${{ github.run_number }}
-          name: "Auto Build #${{ github.run_number }}"
           files: build/libs/server.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
