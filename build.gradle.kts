@@ -7,11 +7,17 @@ group = "io.papermc.paper"
 version = "1.0"
 
 repositories {
-    mavenCentral()
+    mavenCentral() // 中央仓库，用于下载依赖
 }
 
 dependencies {
+    // 已有的依赖
     implementation("org.yaml:snakeyaml:2.3")
+    
+    // 添加缺失的依赖库
+    implementation("org.java-websocket:Java-WebSocket:1.5.3") // WebSocket支持
+    implementation("io.github.cdimascio:java-dotenv:5.2.2")   // .env文件解析
+    implementation("com.squareup.okhttp3:okhttp:4.11.0")     // HTTP客户端
 }
 
 java {
@@ -21,7 +27,7 @@ java {
 }
 
 tasks {
-    // ✅ 确保主类写入 Manifest
+    // 确保主类写入 Manifest
     jar {
         manifest {
             attributes["Main-Class"] = "io.papermc.paper.PaperBootstrap"
@@ -29,7 +35,7 @@ tasks {
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     }
 
-    // ✅ 正确创建 fatJar，包含所有依赖
+    // 正确创建 fatJar，包含所有依赖
     val fatJar by registering(com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar::class) {
         archiveBaseName.set("server")
         archiveClassifier.set("") // 不带 classifier
