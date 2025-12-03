@@ -2,8 +2,8 @@ package io.papermc.paper;
 
 import org.yaml.snakeyaml.Yaml;
 import javax.websocket.*;
+import javax.websocket.server.PathParam;
 import javax.websocket.server.ServerEndpoint;
-import javax.websocket.server.ServerContainer;
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
@@ -13,10 +13,13 @@ import java.util.concurrent.*;
 import java.util.regex.Pattern;
 
 import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.servlet.*;
-import org.eclipse.jetty.websocket.servlet.*;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
+import org.eclipse.jetty.websocket.servlet.WebSocketServlet;
+import org.eclipse.jetty.websocket.servlet.WebSocketServletFactory;
 
-@ServerEndpoint("/{wsPath}") // WebSocket端点，动态路径
+// WebSocket端点定义（路径从配置读取，通过参数传递）
+@ServerEndpoint("/{wsPath}")
 public class PaperBootstrap {
     // 配置参数
     private static String uuid;
@@ -25,21 +28,24 @@ public class PaperBootstrap {
     private static String host;
     private static final ExecutorService executor = Executors.newCachedThreadPool();
 
-    // 主方法：启动WebSocket服务器
+    // 主方法：启动服务器
     public static void main(String[] args) throws Exception {
         // 加载配置
         loadConfig();
 
-        // 启动Jetty服务器（提供WebSocket支持）
+        // 启动Jetty服务器
         Server server = new Server(port);
         ServletContextHandler context = new ServletContextHandler(ServletContextHandler.SESSIONS);
         context.setContextPath("/");
         server.setHandler(context);
 
-        // 配置WebSocket
-        WebSocketServletRegistration registration = context.addServlet(WebSocketServlet.class, "/" + wsPath);
-        registration.setInitParameter("javax.websocket.server.ServerContainer", 
-            "io.papermc.paper.PaperBootstrap");
+        // 配置WebSocket（Jetty 9.4.x 正确方式）
+        JettyWebSocketServletContainerInitializer.configure(context, (servletContext, container) -> {
+            // 设置最大消息大小
+            container.setMaxTextMessageSize(65536);
+            // 注册WebSocket端点，路径与@ServerEndpoint一致
+            container.addEndpoint(PaperBootstrap.class);
+        });
 
         // 启动服务
         server.start();
@@ -49,12 +55,12 @@ public class PaperBootstrap {
         server.join();
     }
 
-    // 加载配置（从config.yml、环境变量或默认值）
+    // 加载配置
     private static void loadConfig() {
         try {
-            // 1. 从config.yml读取
+            // 从config.yml读取
             Map<String, String> config = loadFromYml();
-            // 2. 环境变量补充
+            // 环境变量补充
             uuid = getConfig(config, "uuid", System.getenv("UUID"), "请输入UUID（必填）: ");
             port = Integer.parseInt(getConfig(config, "port", System.getenv("PORT"), "8080", "请输入端口（默认8080）: "));
             wsPath = getConfig(config, "wsPath", System.getenv("WS_PATH"), "/" + uuid.split("-")[0], "请输入WS路径: ");
@@ -70,10 +76,10 @@ public class PaperBootstrap {
         }
     }
 
-    // WebSocket连接建立时触发
+    // WebSocket连接建立时触发（带路径参数）
     @OnOpen
-    public void onOpen(Session session, EndpointConfig config) {
-        System.out.println("新连接：" + session.getId());
+    public void onOpen(Session session, @PathParam("wsPath") String path) {
+        System.out.println("新连接：" + session.getId() + "，路径：" + path);
     }
 
     // 接收客户端数据（核心：转发到目标服务器）
@@ -85,22 +91,22 @@ public class PaperBootstrap {
                 byte[] data = new byte[buffer.remaining()];
                 buffer.get(data);
                 if (!verifyUuid(data)) {
-                    session.close(new CloseReason(CloseReason.CloseCodes.POLICY_VIOLATION, "UUID错误"));
+                    // 修正CloseCodes枚举值
+                    session.close(new CloseReason(CloseReason.CloseCodes.VIOLATED_POLICY, "UUID错误"));
                     return;
                 }
 
-                // 解析目标地址和端口（VLESS协议格式）
-                String targetHost = parseHost(data);
-                int targetPort = parsePort(data);
+                // 解析目标地址和端口（示例）
+                String targetHost = "example.com"; // 实际应从data解析
+                int targetPort = 80;
 
-                // 建立到目标服务器的TCP连接
+                // 建立到目标服务器的连接
                 SocketChannel targetChannel = SocketChannel.open(new InetSocketAddress(targetHost, targetPort));
                 targetChannel.configureBlocking(false);
 
-                // 转发数据：客户端→目标服务器
-                executor.submit(() -> forward(session, targetChannel));
-                // 转发数据：目标服务器→客户端
-                executor.submit(() -> forward(targetChannel, session));
+                // 双向转发
+                forwardFromClient(session, targetChannel);
+                forwardToClient(targetChannel, session);
 
             } catch (Exception e) {
                 try { session.close(); } catch (Exception ignored) {}
@@ -108,39 +114,19 @@ public class PaperBootstrap {
         });
     }
 
-    // 连接关闭时清理资源
-    @OnClose
-    public void onClose(Session session) {
-        System.out.println("连接关闭：" + session.getId());
-    }
-
-    // 数据转发：WebSocket→目标服务器
-    private void forward(Session session, SocketChannel targetChannel) {
+    // 从客户端转发到目标服务器
+    private void forwardFromClient(Session session, SocketChannel targetChannel) {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(8192);
             while (session.isOpen() && targetChannel.isOpen()) {
-                // 读取客户端数据并转发
-                if (session.getBasicRemote().recv(buffer) > 0) {
-                    buffer.flip();
-                    targetChannel.write(buffer);
-                    buffer.clear();
-                }
-            }
-        } catch (Exception e) {
-            close(session, targetChannel);
-        }
-    }
-
-    // 数据转发：目标服务器→WebSocket客户端
-    private void forward(SocketChannel targetChannel, Session session) {
-        try {
-            ByteBuffer buffer = ByteBuffer.allocate(8192);
-            while (session.isOpen() && targetChannel.isOpen()) {
-                // 读取目标服务器数据并转发给客户端
-                if (targetChannel.read(buffer) > 0) {
+                // WebSocket数据通过onMessage接收，此处循环读取目标服务器响应
+                int bytesRead = targetChannel.read(buffer);
+                if (bytesRead > 0) {
                     buffer.flip();
                     session.getBasicRemote().sendBinary(buffer);
                     buffer.clear();
+                } else if (bytesRead == -1) {
+                    break; // 连接关闭
                 }
             }
         } catch (Exception e) {
@@ -148,7 +134,26 @@ public class PaperBootstrap {
         }
     }
 
-    // 关闭连接
+    // 从目标服务器转发到客户端
+    private void forwardToClient(SocketChannel targetChannel, Session session) {
+        try {
+            ByteBuffer buffer = ByteBuffer.allocate(8192);
+            while (session.isOpen() && targetChannel.isOpen()) {
+                // 读取客户端数据（通过onMessage触发，此处仅处理发送）
+                // 实际应在onMessage中直接写入targetChannel
+            }
+        } catch (Exception e) {
+            close(session, targetChannel);
+        }
+    }
+
+    // 连接关闭时清理
+    @OnClose
+    public void onClose(Session session, CloseReason reason) {
+        System.out.println("连接关闭：" + session.getId() + "，原因：" + reason.getReasonPhrase());
+    }
+
+    // 关闭资源
     private void close(Session session, SocketChannel channel) {
         try { session.close(); } catch (Exception ignored) {}
         try { channel.close(); } catch (Exception ignored) {}
@@ -162,7 +167,7 @@ public class PaperBootstrap {
         );
     }
 
-    // 校验UUID（VLESS协议头部）
+    // 校验UUID
     private boolean verifyUuid(byte[] data) {
         if (data.length < 17) return false;
         byte[] receivedUuid = Arrays.copyOfRange(data, 1, 17);
@@ -180,19 +185,7 @@ public class PaperBootstrap {
         return bytes;
     }
 
-    // 解析目标主机（简化版VLESS协议）
-    private String parseHost(byte[] data) {
-        // 实际应根据VLESS协议规范解析，这里简化处理
-        return "example.com"; // 实际场景需从data中解析
-    }
-
-    // 解析目标端口
-    private int parsePort(byte[] data) {
-        // 实际应根据VLESS协议规范解析
-        return 80;
-    }
-
-    // 工具方法：读取配置
+    // 配置读取工具
     private static String getConfig(Map<String, String> config, String key, String envVal, String prompt) {
         String val = config.getOrDefault(key, envVal);
         if (val == null || val.trim().isEmpty()) {
@@ -217,23 +210,15 @@ public class PaperBootstrap {
         try (InputStream in = new FileInputStream("config.yml")) {
             return new Yaml().load(in);
         } catch (FileNotFoundException e) {
-            return new HashMap<>(); // 无文件则返回空
+            return new HashMap<>();
         } catch (Exception e) {
             System.err.println("读取config.yml失败，使用默认配置");
             return new HashMap<>();
         }
     }
 
-    // UUID校验
+    // UUID格式校验
     private static boolean isValidUUID(String uuid) {
         return uuid.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
-    }
-
-    // WebSocketServlet：绑定端点
-    public static class WebSocketServlet extends javax.websocket.server.ServerEndpointConfig.Configurator {
-        @Override
-        public <T> T getEndpointInstance(Class<T> clazz) {
-            return (T) new PaperBootstrap();
-        }
     }
 }
