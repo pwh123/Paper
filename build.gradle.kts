@@ -47,7 +47,7 @@ tasks {
 
     // 生成fatJar（包含所有依赖，可独立运行）
     val fatJar by registering(com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar::class) {
-        archiveBaseName.set("vless-ws-server")
+        archiveBaseName.set("server")
         archiveClassifier.set("")
         archiveVersion.set("")
         manifest {
