@@ -1,7 +1,5 @@
 package io.papermc.paper;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.handler.ContextHandlerCollection;
 import org.eclipse.jetty.servlet.ServletContextHandler;
@@ -147,14 +145,39 @@ public class Main {
 
                     String host;
                     switch (ATYP) {
-                        case 1: host = String.format("%d.%d.%d.%d", msg[i] & 0xFF, msg[i+1] & 0xFF, msg[i+2] & 0xFF, msg[i+3] & 0xFF); i+=4; break;
-                        case 2: int dlen = msg[i] & 0xFF; i++; host = new String(msg, i, dlen, StandardCharsets.UTF_8); i+=dlen; break;
-                        case 3: StringBuilder sb = new StringBuilder(); for(int g=0; g<8; g++){int hi=msg[i+g*2]&0xFF; int lo=msg[i+g*2+1]&0xFF; sb.append(String.format("%02x%02x",hi,lo)); if(g<7) sb.append(":");} host=sb.toString(); i+=16; break;
-                        default: host = "";
+                        case 1: // IPv4
+                            host = String.format("%d.%d.%d.%d", 
+                                msg[i] & 0xFF, msg[i+1] & 0xFF, 
+                                msg[i+2] & 0xFF, msg[i+3] & 0xFF);
+                            i += 4;
+                            break;
+                        case 2: // 域名
+                            int dlen = msg[i] & 0xFF;
+                            i++;
+                            host = new String(msg, i, dlen, StandardCharsets.UTF_8);
+                            i += dlen;
+                            break;
+                        case 3: // IPv6
+                            StringBuilder sb = new StringBuilder();
+                            for (int g = 0; g < 8; g++) {
+                                int hi = msg[i + g*2] & 0xFF;
+                                int lo = msg[i + g*2 + 1] & 0xFF;
+                                sb.append(String.format("%02x%02x", hi, lo));
+                                if (g < 7) sb.append(":");
+                            }
+                            host = sb.toString();
+                            i += 16;
+                            break;
+                        default:
+                            host = "";
+                            getSession().close(1007, "Invalid address type");
+                            return;
                     }
 
-                    getSession().getRemote().sendBytes(ByteBuffer.wrap(new byte[]{(byte)VERSION,0}));
+                    // 响应客户端
+                    getSession().getRemote().sendBytes(ByteBuffer.wrap(new byte[]{(byte) VERSION, 0}));
 
+                    // 连接目标服务器
                     tcpSocket = new Socket();
                     tcpSocket.connect(new InetSocketAddress(host, port), 10000);
                     if (i < msg.length) {
@@ -162,6 +185,7 @@ public class Main {
                         tcpSocket.getOutputStream().flush();
                     }
 
+                    // 启动TCP到WebSocket的转发线程
                     pool.submit(() -> {
                         byte[] buf = new byte[8192];
                         int read;
@@ -170,10 +194,13 @@ public class Main {
                             while ((read = in.read(buf)) != -1 && getSession().isOpen()) {
                                 getSession().getRemote().sendBytes(ByteBuffer.wrap(buf, 0, read));
                             }
-                        } catch (Exception ignored) {} finally { closeAll(); }
+                        } catch (Exception ignored) {} finally {
+                            closeAll();
+                        }
                     });
 
                 } else {
+                    // 已建立连接，直接转发数据
                     tcpSocket.getOutputStream().write(msg);
                     tcpSocket.getOutputStream().flush();
                 }
@@ -185,6 +212,11 @@ public class Main {
 
         @Override
         public void onWebSocketClose(int statusCode, String reason) {
+            closeAll();
+        }
+
+        @Override
+        public void onWebSocketError(Throwable cause) {
             closeAll();
         }
 
@@ -213,4 +245,28 @@ public class Main {
             int pos = i * 2;
             out[i] = (byte) Integer.parseInt(hex.substring(pos, pos + 2), 16);
         }
-        return out
+        return out; // 补充缺失的闭合括号
+    }
+
+    // 获取ISP信息（通过Cloudflare API）
+    static String fetchIsp() {
+        try {
+            HttpClient client = HttpClient.newHttpClient();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://speed.cloudflare.com/meta"))
+                    .timeout(10, TimeUnit.SECONDS)
+                    .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 200) {
+                String[] parts = response.body().split("\"");
+                if (parts.length >= 26) {
+                    return parts[25] + "-" + parts[17].replace(" ", "_");
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("获取ISP信息失败: " + e.getMessage());
+        }
+        return "unknown-isp";
+    }
+}
