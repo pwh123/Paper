@@ -1,255 +1,324 @@
-import org.java_websocket.WebSocket;
-import org.java_websocket.handshake.ClientHandshake;
-import org.java_websocket.server.WebSocketServer;
-import org.java_websocket.server.DefaultSSLWebSocketServerFactory;
-import org.java_websocket.server.WebSocketServerFactory;
+package app;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.OutputStream;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.handler.ContextHandlerCollection;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletHolder;
+import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
+import org.eclipse.jetty.websocket.server.JettyWebSocketCreator;
+import org.eclipse.jetty.websocket.server.JettyWebSocketServerContainer;
+import org.eclipse.jetty.websocket.api.Session;
+import org.eclipse.jetty.websocket.api.WebSocketAdapter;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.net.URLEncoder;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import io.github.cdimascio.dotenv.Dotenv;
+public class Main {
 
-public class PaperBootstrap {
-    // ANSI颜色常量
-    private static final String ANSI_GREEN = "\u001B[32m";
-    private static final String ANSI_RED = "\u001B[31m";
-    private static final String ANSI_RESET = "\u001B[0m";
+    // Read env with defaults; you can load .env via java-dotenv if desired
+    static final String UUID = getenvOrDefault("UUID", "55e8ca56-8a0a-4486-b3f9-b9b0d46638a9");
+    static final String DOMAIN = getenvOrDefault("DOMAIN", "");
+    static final String SUB_PATH = getenvOrDefault("SUB_PATH", "ccc");
+    static final String NAME = getenvOrDefault("NAME", "Vls");
+    static final int PORT = parsePort(getenvOrDefault("PORT", "8080")); // fixed default
 
-    // 配置参数（从.env或环境变量读取）
-    private static final Dotenv dotenv = Dotenv.load();
-    private static final String UUID = getConfig("UUID", "55e8ca56-8a0a-4486-b3f9-b9b0d46638a9");
-    private static final String DOMAIN = getConfig("DOMAIN", "yge.pwhh.dpdns.org");
-    private static final String SUB_PATH = getConfig("SUB_PATH", "ccc");
-    private static final String NAME = getConfig("NAME", "Vls");
-    private static final int PORT = Integer.parseInt(getConfig("PORT", "36500"));
-    
-    // WebSocket路径（UUID前8位）
-    private static final String UUID_PREFIX = UUID.split("-")[0];
-    private static final String WS_PATH = "/" + UUID_PREFIX;
-    
-    // ISP信息
-    private static String ISP = "unknown-isp";
+    // UUID prefix-based path
+    static final String uuidPrefix = UUID.split("-")[0];
+    static final String wsPath = "/" + uuidPrefix;
 
-    // 配置读取工具方法
-    private static String getConfig(String key, String defaultValue) {
-        String envValue = System.getenv(key);
-        return (envValue != null && !envValue.isEmpty()) ? envValue : dotenv.get(key, defaultValue);
-    }
+    // ISP name (from Cloudflare meta, fallback to "UnknownISP")
+    static final String ISP = fetchIsp();
 
     public static void main(String[] args) throws Exception {
-        // 初始化ISP信息
-        initIspInfo();
+        Server server = new Server(PORT);
 
-        // 启动续期脚本
-        startRenewScript();
+        // HTTP context
+        ServletContextHandler httpCtx = new ServletContextHandler(ServletContextHandler.SESSIONS);
+        httpCtx.setContextPath("/");
+        // /web -> Hello, World
+        httpCtx.addServlet(new ServletHolder(new WebServlet()), "/web");
+        // /{SUB_PATH} -> base64 VLESS URL
+        httpCtx.addServlet(new ServletHolder(new VlessServlet(UUID, DOMAIN, NAME, wsPath, ISP)), "/" + SUB_PATH);
 
-        // 启动HTTP服务器
-        com.sun.net.httpserver.HttpServer httpServer = com.sun.net.httpserver.HttpServer.create(new InetSocketAddress(PORT), 0);
-        httpServer.createContext("/web", new WebHandler());
-        httpServer.createContext("/" + SUB_PATH, new SubPathHandler());
-        httpServer.start();
-        System.out.println("HTTP Server started on port " + PORT);
-
-        // 启动WebSocket服务器
-        WebSocketServer wsServer = new VlessWebSocketServer(new InetSocketAddress(PORT), WS_PATH);
-        wsServer.start();
-        System.out.println("WebSocket Server started on path: " + WS_PATH);
-    }
-
-    // 启动续期脚本 renew.sh
-    private static void startRenewScript() {
-        File renewScript = new File("renew.sh");
-        if (renewScript.exists() && renewScript.isFile()) {
-            try {
-                new ProcessBuilder("bash", "renew.sh")
-                        .inheritIO()
-                        .start();
-                System.out.println(ANSI_GREEN + "renew.sh 已启动（自动续期中）" + ANSI_RESET);
-            } catch (IOException e) {
-                System.err.println(ANSI_RED + "执行 renew.sh 失败: " + e.getMessage() + ANSI_RESET);
-            }
-        } else {
-            System.err.println(ANSI_RED + "renew.sh 未找到，跳过执行" + ANSI_RESET);
-        }
-    }
-
-    // 从Cloudflare API获取ISP信息
-    private static void initIspInfo() {
-        try {
-            OkHttpClient client = new OkHttpClient.Builder()
-                    .connectTimeout(10, TimeUnit.SECONDS)
-                    .build();
-            Request request = new Request.Builder()
-                    .url("https://speed.cloudflare.com/meta")
-                    .get()
-                    .build();
-            Response response = client.newCall(request).execute();
-            if (response.isSuccessful() && response.body() != null) {
-                String meta = response.body().string();
-                String[] parts = meta.split("\"");
-                if (parts.length >= 26) {
-                    ISP = parts[25] + "-" + parts[17];
-                    ISP = ISP.replace(" ", "_");
-                }
-            }
-        } catch (Exception e) {
-            System.err.println("获取ISP信息失败: " + e.getMessage());
-        }
-    }
-
-    // HTTP处理器：处理/web路径
-    static class WebHandler implements com.sun.net.httpserver.HttpHandler {
-        @Override
-        public void handle(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
-            String response = "Hello, World\n";
-            exchange.sendResponseHeaders(200, response.getBytes().length);
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(response.getBytes());
-            }
-        }
-    }
-
-    // HTTP处理器：生成VLESS节点订阅
-    static class SubPathHandler implements com.sun.net.httpserver.HttpHandler {
-        @Override
-        public void handle(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
-            String encodedWsPath = URLEncoder.encode(WS_PATH, StandardCharsets.UTF_8.name());
-            
-            String vlessUrl = String.format(
-                    "vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%s#%s-%s",
-                    UUID, DOMAIN, DOMAIN, DOMAIN, encodedWsPath, NAME, ISP
-            );
-            
-            String base64Content = Base64.getEncoder().encodeToString(vlessUrl.getBytes(StandardCharsets.UTF_8));
-            
-            exchange.sendResponseHeaders(200, base64Content.getBytes().length);
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(base64Content.getBytes());
-            }
-        }
-    }
-
-    // WebSocket服务器：处理VLESS代理
-    static class VlessWebSocketServer extends WebSocketServer {
-        private final String cleanUuid;
-
-        public VlessWebSocketServer(InetSocketAddress address, String path) {
-            super(createServerFactory(path), address);
-            this.cleanUuid = UUID.replace("-", "");
-        }
-
-        // 创建WebSocket服务器工厂，指定路径
-        private static WebSocketServerFactory createServerFactory(String path) {
-            return new DefaultSSLWebSocketServerFactory() {
+        // WebSocket context mounted at root; bind creator only on wsPath
+        JettyWebSocketServletContainerInitializer.configure(httpCtx, (context, container) -> {
+            JettyWebSocketServerContainer jettyContainer = (JettyWebSocketServerContainer) container;
+            jettyContainer.addMapping(wsPath, new JettyWebSocketCreator() {
                 @Override
-                public String getWebSocketPath() {
-                    return path;
+                public Object createWebSocket(org.eclipse.jetty.websocket.server.JettyServerUpgradeRequest req,
+                                              org.eclipse.jetty.websocket.server.JettyServerUpgradeResponse resp) {
+                    return new ProxySocket(UUID);
                 }
-            };
-        }
+            });
+        });
 
-        @Override
-        public void onOpen(WebSocket conn, ClientHandshake handshake) {
-            System.out.println("新WebSocket连接: " + conn.getRemoteSocketAddress());
-        }
+        ContextHandlerCollection handlers = new ContextHandlerCollection();
+        handlers.addHandler(httpCtx);
+        server.setHandler(handlers);
 
-        @Override
-        public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-            System.out.println("WebSocket连接关闭: " + conn.getRemoteSocketAddress());
-        }
+        server.start();
+        System.out.println("Server running on port " + PORT);
+        System.out.println("WebSocket路径: " + wsPath);
+        server.join();
+    }
 
-        @Override
-        public void onMessage(WebSocket conn, String message) {
-            // 忽略文本消息
-        }
+    // --- HTTP servlets ---
 
+    static class WebServlet extends HttpServlet {
         @Override
-        public void onMessage(WebSocket conn, ByteBuffer message) {
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) {
             try {
-                byte[] msgBytes = message.array();
-                if (msgBytes.length < 18) {
-                    conn.close(1007, "无效消息长度");
-                    return;
+                resp.setStatus(200);
+                resp.setContentType("text/plain");
+                resp.getWriter().println("Hello, World");
+            } catch (Exception ignored) {}
+        }
+    }
+
+    static class VlessServlet extends HttpServlet {
+        private final String uuid;
+        private final String domain;
+        private final String name;
+        private final String wsPath;
+        private final String isp;
+
+        VlessServlet(String uuid, String domain, String name, String wsPath, String isp) {
+            this.uuid = uuid;
+            this.domain = domain;
+            this.name = name;
+            this.wsPath = wsPath;
+            this.isp = isp;
+        }
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) {
+            try {
+                resp.setStatus(200);
+                resp.setContentType("text/plain");
+
+                // Build VLESS URL
+                String pathEnc = java.net.URLEncoder.encode(wsPath, StandardCharsets.UTF_8);
+                String vlessURL = String.format(
+                        "vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%s#%s-%s",
+                        uuid, domain, domain, domain, pathEnc, name, isp
+                );
+                String base64 = Base64.getEncoder().encodeToString(vlessURL.getBytes(StandardCharsets.UTF_8));
+                resp.getWriter().println(base64);
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // --- WebSocket proxy ---
+
+    static class ProxySocket extends WebSocketAdapter {
+        private final byte[] uuidBytes; // 16 bytes parsed from UUID (hex)
+        private final ExecutorService pool = Executors.newCachedThreadPool();
+        private Socket tcpSocket;
+
+        ProxySocket(String uuid) {
+            this.uuidBytes = parseUuidHex(uuid);
+        }
+
+        @Override
+        public void onWebSocketConnect(Session sess) {
+            super.onWebSocketConnect(sess);
+        }
+
+        @Override
+        public void onWebSocketBinary(byte[] payload, int offset, int len) {
+            try {
+                byte[] msg = Arrays.copyOfRange(payload, offset, offset + len);
+
+                // First frame contains handshake and target info in your custom format
+                if (tcpSocket == null) {
+                    // VERSION
+                    int VERSION = msg[0] & 0xFF;
+
+                    // id bytes: msg[1..16]
+                    byte[] id = Arrays.copyOfRange(msg, 1, 17);
+                    if (!Arrays.equals(id, uuidBytes)) {
+                        getSession().close(1007, "Invalid UUID");
+                        return;
+                    }
+
+                    // i = msg[17] + 19
+                    int i = (msg[17] & 0xFF) + 19;
+
+                    // port (UInt16BE)
+                    int port = ((msg[i] & 0xFF) << 8) | (msg[i + 1] & 0xFF);
+                    i += 2;
+
+                    // ATYP
+                    int ATYP = msg[i] & 0xFF;
+                    i += 1;
+
+                    // host parsing
+                    String host;
+                    switch (ATYP) {
+                        case 1: // IPv4
+                            host = String.format("%d.%d.%d.%d", msg[i] & 0xFF, msg[i + 1] & 0xFF,
+                                    msg[i + 2] & 0xFF, msg[i + 3] & 0xFF);
+                            i += 4;
+                            break;
+                        case 2: // domain
+                            int dlen = msg[i] & 0xFF;
+                            i += 1;
+                            host = new String(msg, i, dlen, StandardCharsets.UTF_8);
+                            i += dlen;
+                            break;
+                        case 3: // IPv6
+                            // 16 bytes -> 8 groups
+                            StringBuilder sb = new StringBuilder();
+                            for (int g = 0; g < 8; g++) {
+                                int hi = msg[i + g * 2] & 0xFF;
+                                int lo = msg[i + g * 2 + 1] & 0xFF;
+                                sb.append(String.format("%02x%02x", hi, lo));
+                                if (g < 7) sb.append(":");
+                            }
+                            host = sb.toString();
+                            i += 16;
+                            break;
+                        default:
+                            host = "";
+                    }
+
+                    // respond [VERSION, 0]
+                    getSession().getRemote().sendBytes(ByteBuffer.wrap(new byte[]{(byte) VERSION, 0}));
+
+                    // connect TCP and start piping
+                    tcpSocket = new Socket();
+                    tcpSocket.connect(new InetSocketAddress(host, port), 10_000);
+                    // write remaining initial bytes (if any)
+                    if (i < msg.length) {
+                        tcpSocket.getOutputStream().write(msg, i, msg.length - i);
+                        tcpSocket.getOutputStream().flush();
+                    }
+
+                    // TCP -> WS
+                    pool.submit(() -> {
+                        byte[] buf = new byte[8192];
+                        int read;
+                        try {
+                            var in = tcpSocket.getInputStream();
+                            while ((read = in.read(buf)) != -1 && getSession().isOpen()) {
+                                getSession().getRemote().sendBytes(ByteBuffer.wrap(buf, 0, read));
+                            }
+                        } catch (Exception ignored) {
+                        } finally {
+                            closeAll();
+                        }
+                    });
+
+                } else {
+                    // Subsequent frames: forward to TCP
+                    tcpSocket.getOutputStream().write(msg);
+                    tcpSocket.getOutputStream().flush();
                 }
-
-                if (!validateUuid(msgBytes)) {
-                    conn.close(1007, "UUID验证失败");
-                    return;
-                }
-
-                int port = ((msgBytes[18] & 0xFF) << 8) | (msgBytes[19] & 0xFF);
-                int atyp = msgBytes[20] & 0xFF;
-                String targetHost = parseHost(msgBytes, atyp, 21);
-
-                conn.send(ByteBuffer.wrap(new byte[]{msgBytes[0], 0x00}));
-
-                Socket targetSocket = new Socket(targetHost, port);
-                System.out.println("已连接目标服务器: " + targetHost + ":" + port);
-
-                new Thread(() -> forwardFromSocketToWs(targetSocket, conn)).start();
-                new Thread(() -> forwardFromWsToSocket(conn, targetSocket)).start();
 
             } catch (Exception e) {
-                System.err.println("WebSocket消息处理错误: " + e.getMessage());
-                conn.close(1011, "处理消息失败");
+                closeAll();
             }
         }
 
-        private boolean validateUuid(byte[] msgBytes) {
-            byte[] uuidBytes = new byte[16];
-            for (int i = 0; i < 16; i++) {
-                uuidBytes[i] = (byte) Integer.parseInt(cleanUuid.substring(i * 2, i * 2 + 2), 16);
-            }
-            for (int i = 0; i < 16; i++) {
-                if (msgBytes[i + 1] != uuidBytes[i]) {
-                    return false;
-                }
-            }
-            return true;
+        @Override
+        public void onWebSocketText(String message) {
+            // Not used; protocol expects binary
         }
 
-        private String parseHost(byte[] msgBytes, int atyp, int startIndex) throws IOException {
-            switch (atyp) {
-                case 1: // IPv4
-                    return String.format("%d.%d.%d.%d",
-                            msgBytes[startIndex] & 0xFF,
-                            msgBytes[startIndex + 1] & 0xFF,
-                            msgBytes[startIndex + 2] & 0xFF,
-                            msgBytes[startIndex + 3] & 0xFF);
-                case 2: // 域名
-                    int domainLen = msgBytes[startIndex] & 0xFF;
-                    return new String(msgBytes, startIndex + 1, domainLen, StandardCharsets.UTF_8);
-                case 3: // IPv6
-                    byte[] ipv6Bytes = new byte[16];
-                    System.arraycopy(msgBytes, startIndex, ipv6Bytes, 0, 16);
-                    return "[" + java.net.Inet6Address.getByAddress(ipv6Bytes).getHostAddress() + "]";
-                default:
-                    throw new IOException("不支持的地址类型: " + atyp);
-            }
+        @Override
+        public void onWebSocketError(Throwable cause) {
+            closeAll();
         }
 
-        private void forwardFromSocketToWs(Socket socket, WebSocket ws) {
-            try (java.io.InputStream in = socket.getInputStream()) {
-                byte[] buffer = new byte[4096];
-                int len;
-                while ((len = in.read(buffer)) != -1) {
-                    ws.send(ByteBuffer.wrap(buffer, 0, len));
-                }
-            } catch (Exception e) {
-                if (!socket.isClosed()) {
-                    System.err.println("Socket到WS转发错误: " + e.getMessage());
-                }
+        @Override
+        public void onWebSocketClose(int statusCode, String reason) {
+            closeAll();
+        }
+
+        private void closeAll() {
+            try {
+                if (tcpSocket != null && !tcpSocket.isClosed()) tcpSocket.close();
+            } catch (Exception ignored) {}
+            try {
+                if (getSession() != null && getSession().isOpen()) getSession().close();
+            } catch (Exception ignored) {}
+            pool.shutdownNow();
+            try {
+                pool.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {}
+        }
+    }
+
+    // --- Utilities ---
+
+    static String getenvOrDefault(String key, String def) {
+        String v = System.getenv(key);
+        return (v == null || v.isBlank()) ? def : v;
+    }
+
+    static int parsePort(String s) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return 8080;
+        }
+    }
+
+    static byte[] parseUuidHex(String uuid) {
+        String hex = uuid.replace("-", "").toLowerCase();
+        byte[] out = new byte[16];
+        for (int i = 0; i < 16; i++) {
+            int pos = i * 2;
+            out[i] = (byte) Integer.parseInt(hex.substring(pos, pos + 2), 16);
+        }
+        return out;
+    }
+
+    static String fetchIsp() {
+        // Try Cloudflare JSON instead of shell/awk for cross-platform reliability
+        try {
+            HttpClient client = HttpClient.newHttpClient();
+            HttpRequest req = HttpRequest.newBuilder(URI.create("https://speed.cloudflare.com/meta"))
+                    .GET().build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                ObjectMapper mapper = new ObjectMapper();
+                JsonNode root = mapper.readTree(resp.body());
+                // Combine ASN and organization if available
+                String asn = opt(root, "clientAsn");
+                String org = opt(root, "clientAsnName");
+                String region = opt(root, "region");
+                String city = opt(root, "city");
+                String merged = String.join("-", Arrays.stream(new String[]{org, asn, region, city})
+                        .filter(s -> s != null && !s.isBlank()).toArray(String[]::new));
+                return merged.isBlank() ? "UnknownISP" : merged.replace(' ', '_');
+            }
+        } catch (Exception ignored) {}
+        return "UnknownISP";
+    }
+
+    static String opt(JsonNode node, String field) {
+        JsonNode n = node.get(field);
+        return n != null && !n.isNull() ? n.asText() : null;
+    }
+}           }
             } finally {
                 try {
                     socket.close();
