@@ -1,30 +1,25 @@
 plugins {
-    id 'java'
-    id 'application'
+    java
+    application
 }
 
-// 主类名（不含包）
-mainClassName = 'V2RayProxy'
+group = "com.example"
+version = "1.0.0"
 
-// Java 版本
-sourceCompatibility = 1.8
-targetCompatibility = 1.8
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
 
-// 项目信息
-group = 'com.example'
-version = '1.0.0'
+application {
+    mainClass.set("PaperBootstrap") // 替换为你的主类
+}
 
-// 编译与打包编码
-compileJava.options.encoding = 'UTF-8'
-compileTest.options.encoding = 'UTF-8'
+// 编译选项
+compileJava {
+    options.encoding = "UTF-8"
+}
 
-// 发布可执行 jar
-jar {
-    manifest {
-        attributes 'Main-Class': mainClassName
-    }
-    // 把 class 文件打包进 jar
-    from {
-        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
-    }
+tasks.test {
+    systemProperty("file.encoding", "UTF-8")
 }
