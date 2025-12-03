@@ -1,233 +1,271 @@
 package io.papermc.paper;
 
 import org.yaml.snakeyaml.Yaml;
-import javax.websocket.*;
-import javax.websocket.server.PathParam;
-import javax.websocket.server.ServerEndpoint;
 import java.io.*;
 import java.net.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.SocketChannel;
+import java.nio.file.*;
+import java.time.*;
 import java.util.*;
+import java.time.format.DateTimeFormatter;
 import java.util.concurrent.*;
-import java.util.regex.Pattern;
+import java.util.regex.*;
 
-import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.servlet.ServletContextHandler;
-import org.eclipse.jetty.servlet.ServletHolder;
-import org.eclipse.jetty.websocket.servlet.WebSocketServlet;
-import org.eclipse.jetty.websocket.servlet.WebSocketServletFactory;
-
-// WebSocket端点定义
-@ServerEndpoint("/{wsPath}")
 public class PaperBootstrap {
-    // 配置参数
+
     private static String uuid;
-    private static int port;
-    private static String wsPath;
-    private static String host;
-    private static final ExecutorService executor = Executors.newCachedThreadPool();
+    private static Process singboxProcess;
 
-    // 主方法：启动服务器
-    public static void main(String[] args) throws Exception {
-        // 加载配置
-        loadConfig();
-
-        // 启动Jetty服务器
-        Server server = new Server(port);
-        ServletContextHandler context = new ServletContextHandler(ServletContextHandler.SESSIONS);
-        context.setContextPath("/");
-        server.setHandler(context);
-
-        // 注册WebSocket Servlet（Jetty 9.4.x兼容方式）
-        ServletHolder holder = new ServletHolder("VLESS-WS-Servlet", MyWebSocketServlet.class);
-        context.addServlet(holder, "/" + wsPath + "/*");
-
-        // 启动服务
-        server.start();
-        System.out.println("✅ VLESS-WS节点已部署");
-        System.out.println("服务地址：ws://" + host + ":" + port + "/" + wsPath);
-        System.out.println("VLESS链接：" + generateVlessLink());
-        server.join();
-    }
-
-    // 内部类：WebSocket Servlet适配器（适配Jetty 9.4.x）
-    public static class MyWebSocketServlet extends WebSocketServlet {
-        @Override
-        public void configure(WebSocketServletFactory factory) {
-            // 注册WebSocket端点类
-            factory.register(PaperBootstrap.class);
-            // 设置最大消息大小（防止过大消息）
-            factory.getPolicy().setMaxBinaryMessageSize(1024 * 1024); // 1MB
-        }
-    }
-
-    // 加载配置（从config.yml、环境变量或控制台输入）
-    private static void loadConfig() {
+    public static void main(String[] args) {
         try {
-            // 1. 从config.yml读取
-            Map<String, String> config = loadFromYml();
-            // 2. 环境变量补充
-            uuid = getConfig(config, "uuid", System.getenv("UUID"), "请输入UUID（必填）: ");
-            port = Integer.parseInt(getConfig(config, "port", System.getenv("PORT"), "8080", "请输入端口（默认8080）: "));
-            wsPath = getConfig(config, "wsPath", System.getenv("WS_PATH"), "/" + uuid.split("-")[0], "请输入WS路径（默认UUID前8位）: ");
-            host = getConfig(config, "host", System.getenv("HOST"), "0.0.0.0", "请输入主机名（默认0.0.0.0）: ");
+            System.out.println("config.yml 加载中...");
+            Map<String, Object> config = loadConfig();
 
-            // 校验UUID格式
-            if (!isValidUUID(uuid)) {
-                throw new RuntimeException("UUID格式错误（应为8-4-4-4-12位，如：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）");
+            // 从config.yml读取UUID（必填项）
+            uuid = trim((String) config.get("uuid"));
+            
+            // 校验必填配置
+            if (uuid.isEmpty() || !isValidUUID(uuid)) {
+                throw new RuntimeException("❌ config.yml中uuid配置无效（格式应为标准UUID）");
             }
+            System.out.println("已加载UUID: " + uuid);
+
+            // 读取VLESS-WS端口（必填）
+            String vlessPort = trim((String) config.get("vless_port"));
+            if (vlessPort.isEmpty()) {
+                throw new RuntimeException("❌ config.yml中未配置vless_port");
+            }
+
+            // 读取WebSocket路径（默认使用UUID前8位）
+            String wsPath = trim((String) config.get("ws_path"));
+            if (wsPath.isEmpty()) {
+                wsPath = "/" + uuid.split("-")[0]; // 默认路径
+                System.out.println("未配置ws_path，使用默认值: " + wsPath);
+            }
+
+            // 读取主机名（用于生成链接，默认自动检测公网IP）
+            String host = trim((String) config.get("host"));
+            if (host.isEmpty()) {
+                host = detectPublicIP();
+                System.out.println("未配置host，自动检测公网IP: " + host);
+            }
+
+            Path baseDir = Paths.get("/tmp/.singbox");
+            Files.createDirectories(baseDir);
+            Path configJson = baseDir.resolve("config.json");
+            Path bin = baseDir.resolve("sing-box");
+
+            System.out.println("✅ config.yml 加载成功");
+
+            // 获取并下载最新sing-box
+            String version = fetchLatestSingBoxVersion();
+            safeDownloadSingBox(version, bin, baseDir);
+
+            // 生成VLESS-WS（无TLS）配置
+            generateSingBoxConfig(configJson, vlessPort, wsPath);
+
+            // 启动sing-box并设置每日重启
+            singboxProcess = startSingBox(bin, configJson);
+            scheduleDailyRestart(bin, configJson);
+
+            // 输出VLESS链接
+            printVlessLink(host, vlessPort, wsPath);
+
+            // 注册进程退出钩子，清理临时文件
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try { deleteDirectory(baseDir); } catch (IOException ignored) {}
+            }));
+
         } catch (Exception e) {
-            System.err.println("配置错误：" + e.getMessage());
-            System.exit(1);
+            e.printStackTrace();
         }
     }
 
-    // WebSocket连接建立时触发
-    @OnOpen
-    public void onOpen(Session session, @PathParam("wsPath") String path) {
-        System.out.println("新连接：" + session.getId() + "，路径：" + path);
-    }
-
-    // 接收客户端数据（核心转发逻辑）
-    @OnMessage
-    public void onMessage(Session session, ByteBuffer buffer) {
-        executor.submit(() -> {
-            try {
-                // 读取客户端数据
-                byte[] data = new byte[buffer.remaining()];
-                buffer.get(data);
-
-                // 验证UUID（VLESS协议简易校验）
-                if (!verifyUuid(data)) {
-                    session.close(new CloseReason(CloseReason.CloseCodes.VIOLATED_POLICY, "UUID验证失败"));
-                    return;
-                }
-
-                // 解析目标地址和端口（示例：实际应按VLESS协议规范解析）
-                String targetHost = "example.com"; // 替换为真实解析逻辑
-                int targetPort = 80;
-
-                // 建立到目标服务器的连接
-                SocketChannel targetChannel = SocketChannel.open(new InetSocketAddress(targetHost, targetPort));
-                targetChannel.configureBlocking(false);
-
-                // 启动双向转发
-                forwardClientToTarget(session, targetChannel);
-                forwardTargetToClient(targetChannel, session);
-
-            } catch (Exception e) {
-                try { session.close(); } catch (Exception ignored) {}
+    // 生成VLESS-WS（无TLS）配置
+    private static void generateSingBoxConfig(Path configFile, String port, String wsPath) throws IOException {
+        // VLESS入站配置（无TLS，WebSocket传输）
+        String vlessInbound = """
+          {
+            "type": "vless",
+            "listen": "::",
+            "listen_port": %s,
+            "users": [{"uuid": "%s", "flow": ""}],
+            "network": "ws",
+            "ws": {
+              "path": "%s",
+              "headers": {
+                "Host": "example.com"  // 可自定义Host头
+              }
+            },
+            "tls": {
+              "enabled": false  // 禁用TLS
             }
-        });
-    }
+          }
+        """.formatted(port, uuid, wsPath);
 
-    // 客户端 → 目标服务器 数据转发
-    private void forwardClientToTarget(Session session, SocketChannel targetChannel) {
-        try {
-            ByteBuffer buffer = ByteBuffer.allocate(8192);
-            while (session.isOpen() && targetChannel.isOpen()) {
-                // 读取目标服务器响应并转发给客户端
-                int bytesRead = targetChannel.read(buffer);
-                if (bytesRead > 0) {
-                    buffer.flip();
-                    session.getBasicRemote().sendBinary(buffer);
-                    buffer.clear();
-                } else if (bytesRead == -1) {
-                    break; // 目标服务器关闭连接
-                }
-            }
-        } catch (Exception e) {
-            closeResources(session, targetChannel);
+        // 完整配置
+        String json = """
+        {
+          "log": { "level": "info" },
+          "inbounds": [%s],
+          "outbounds": [{"type": "direct"}]
         }
+        """.formatted(vlessInbound);
+
+        Files.writeString(configFile, json);
+        System.out.println("✅ sing-box 配置生成完成（VLESS-WS 无TLS）");
     }
 
-    // 目标服务器 → 客户端 数据转发
-    private void forwardTargetToClient(SocketChannel targetChannel, Session session) {
-        try {
-            ByteBuffer buffer = ByteBuffer.allocate(8192);
-            while (session.isOpen() && targetChannel.isOpen()) {
-                // 此处通过onMessage接收客户端数据后直接写入目标服务器
-                // （实际应在onMessage中处理写入逻辑）
-            }
-        } catch (Exception e) {
-            closeResources(session, targetChannel);
-        }
-    }
-
-    // 连接关闭时清理资源
-    @OnClose
-    public void onClose(Session session, CloseReason reason) {
-        System.out.println("连接关闭：" + session.getId() + "，原因：" + reason.getReasonPhrase());
-    }
-
-    // 关闭会话和通道资源
-    private void closeResources(Session session, SocketChannel channel) {
-        try { session.close(); } catch (Exception ignored) {}
-        try { channel.close(); } catch (Exception ignored) {}
-    }
-
-    // 生成VLESS节点链接
-    private static String generateVlessLink() {
-        return String.format(
-            "vless://%s@%s:%d?encryption=none&security=none&type=ws&host=%s&path=%s#VLESS-WS节点",
-            uuid, host, port, host, wsPath
+    // 输出VLESS链接
+    private static void printVlessLink(String host, String port, String wsPath) {
+        System.out.println("\n=== ✅ 已部署VLESS-WS节点（无TLS） ===");
+        // VLESS链接格式：vless://uuid@host:port?encryption=none&security=none&type=ws&path=wsPath#备注
+        String link = String.format(
+            "vless://%s@%s:%s?encryption=none&security=none&type=ws&path=%s#VLESS-WS(无TLS)",
+            uuid, host, port, wsPath
         );
-    }
-
-    // 验证UUID（VLESS协议头部校验）
-    private boolean verifyUuid(byte[] data) {
-        if (data.length < 17) return false; // VLESS头部至少17字节（版本+UUID）
-        byte[] receivedUuid = Arrays.copyOfRange(data, 1, 17); // 跳过版本字节（第1位）
-        byte[] expectedUuid = uuidToBytes(uuid);
-        return Arrays.equals(receivedUuid, expectedUuid);
-    }
-
-    // UUID转字节数组（用于协议校验）
-    private byte[] uuidToBytes(String uuid) {
-        String hex = uuid.replace("-", "");
-        byte[] bytes = new byte[16];
-        for (int i = 0; i < 16; i++) {
-            bytes[i] = (byte) Integer.parseInt(hex.substring(i*2, i*2+2), 16);
-        }
-        return bytes;
-    }
-
-    // 配置读取工具方法
-    private static String getConfig(Map<String, String> config, String key, String envVal, String prompt) {
-        String val = config.getOrDefault(key, envVal);
-        if (val == null || val.trim().isEmpty()) {
-            System.out.print(prompt);
-            val = new Scanner(System.in).nextLine().trim();
-        }
-        return val;
-    }
-
-    private static String getConfig(Map<String, String> config, String key, String envVal, String defVal, String prompt) {
-        String val = config.getOrDefault(key, envVal);
-        if (val == null || val.trim().isEmpty()) {
-            System.out.print(prompt);
-            val = new Scanner(System.in).nextLine().trim();
-            if (val.isEmpty()) val = defVal;
-        }
-        return val;
-    }
-
-    // 从config.yml读取配置
-    private static Map<String, String> loadFromYml() {
-        try (InputStream in = new FileInputStream("config.yml")) {
-            return new Yaml().load(in);
-        } catch (FileNotFoundException e) {
-            System.out.println("未找到config.yml，将使用环境变量或手动输入");
-            return new HashMap<>();
-        } catch (Exception e) {
-            System.err.println("读取config.yml失败，使用默认配置：" + e.getMessage());
-            return new HashMap<>();
-        }
+        System.out.println("节点链接：");
+        System.out.println(link);
     }
 
     // UUID格式校验
-    private static boolean isValidUUID(String uuid) {
-        return uuid.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+    private static boolean isValidUUID(String u) {
+        return u != null && u.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+    }
+
+    // 工具方法：字符串修剪（处理null和空值）
+    private static String trim(String s) { return s == null ? "" : s.trim(); }
+
+    // 加载config.yml配置
+    private static Map<String, Object> loadConfig() throws IOException {
+        Yaml yaml = new Yaml();
+        try (InputStream in = Files.newInputStream(Paths.get("config.yml"))) {
+            Object o = yaml.load(in);
+            if (o instanceof Map) return (Map<String, Object>) o;
+            return new HashMap<>();
+        } catch (FileNotFoundException e) {
+            throw new RuntimeException("❌ 未找到config.yml文件，请创建并配置");
+        }
+    }
+
+    // 获取最新sing-box版本
+    private static String fetchLatestSingBoxVersion() {
+        String fallback = "1.12.12";
+        try {
+            URL url = new URL("https://api.github.com/repos/SagerNet/sing-box/releases/latest");
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                String json = br.lines().reduce("", (a, b) -> a + b);
+                int i = json.indexOf("\"tag_name\":\"v");
+                if (i != -1) {
+                    String v = json.substring(i + 13, json.indexOf("\"", i + 13));
+                    System.out.println("🔍 最新sing-box版本: " + v);
+                    return v;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("⚠️ 获取版本失败，使用回退版本 " + fallback);
+        }
+        return fallback;
+    }
+
+    // 下载并解压sing-box
+    private static void safeDownloadSingBox(String version, Path bin, Path dir) throws IOException, InterruptedException {
+        if (Files.exists(bin)) return;
+        String arch = detectArch();
+        String file = "sing-box-" + version + "-linux-" + arch + ".tar.gz";
+        String url = "https://github.com/SagerNet/sing-box/releases/download/v" + version + "/" + file;
+
+        System.out.println("⬇️ 下载 sing-box: " + url);
+        Path tar = dir.resolve(file);
+        new ProcessBuilder("bash", "-c", "curl -L -o " + tar + " \"" + url + "\"").inheritIO().start().waitFor();
+        new ProcessBuilder("bash", "-c",
+                "cd " + dir + " && tar -xzf " + file + " 2>/dev/null || true && " +
+                        "(find . -type f -name 'sing-box' -exec mv {} ./sing-box \\; ) && chmod +x sing-box || true")
+                .inheritIO().start().waitFor();
+
+        if (!Files.exists(bin)) throw new IOException("未找到 sing-box 可执行文件！");
+        System.out.println("✅ 成功解压 sing-box 可执行文件");
+    }
+
+    // 检测系统架构（amd64/arm64）
+    private static String detectArch() {
+        String a = System.getProperty("os.arch").toLowerCase();
+        if (a.contains("aarch") || a.contains("arm")) return "arm64";
+        return "amd64";
+    }
+
+    // 启动sing-box进程
+    private static Process startSingBox(Path bin, Path cfg) throws IOException, InterruptedException {
+        System.out.println("正在启动 sing-box...");
+        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
+        pb.redirectErrorStream(true);
+        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD); // 静默运行（可改为日志文件）
+        Process p = pb.start();
+        Thread.sleep(1500); // 等待启动
+        System.out.println("sing-box 已启动，PID: " + p.pid());
+        return p;
+    }
+
+    // 检测公网IP
+    private static String detectPublicIP() {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new URL("https://api.ipify.org").openStream()))) {
+            return br.readLine();
+        } catch (Exception e) {
+            return "your-server-ip"; // 失败时返回占位符
+        }
+    }
+
+    // 定时每日重启sing-box
+    private static void scheduleDailyRestart(Path bin, Path cfg) {
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+        Runnable restartTask = () -> {
+            System.out.println("\n[定时重启] 北京时间 00:03，准备重启 sing-box...");
+
+            if (singboxProcess != null && singboxProcess.isAlive()) {
+                System.out.println("正在停止旧进程 (PID: " + singboxProcess.pid() + ")...");
+                singboxProcess.destroy();
+                try {
+                    if (!singboxProcess.waitFor(10, TimeUnit.SECONDS)) {
+                        System.out.println("进程未响应，强制终止...");
+                        singboxProcess.destroyForcibly();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            try {
+                ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
+                pb.redirectErrorStream(true);
+                pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+                pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+                singboxProcess = pb.start();
+                System.out.println("sing-box 重启成功，新 PID: " + singboxProcess.pid());
+            } catch (Exception e) {
+                System.err.println("重启失败: " + e.getMessage());
+                e.printStackTrace();
+            }
+        };
+
+        ZoneId zone = ZoneId.of("Asia/Shanghai");
+        LocalDateTime now = LocalDateTime.now(zone);
+        LocalDateTime next = now.withHour(0).withMinute(3).withSecond(0).withNano(0);
+        if (!next.isAfter(now)) next = next.plusDays(1);
+
+        long initialDelay = Duration.between(now, next).getSeconds();
+        scheduler.scheduleAtFixedRate(restartTask, initialDelay, 86_400, TimeUnit.SECONDS);
+
+        System.out.printf("[定时重启] 已计划每日 00:03 重启（首次执行：%s）%n",
+                next.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+    }
+
+    // 递归删除目录
+    private static void deleteDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        Files.walk(dir).sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
     }
 }
