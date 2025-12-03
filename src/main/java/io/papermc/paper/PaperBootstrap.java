@@ -1,259 +1,281 @@
-package io.papermc.paper;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+import io.github.cdimascio.dotenv.Dotenv;
+import org.java_websocket.WebSocket;
+import org.java_websocket.handshake.ClientHandshake;
+import org.java_websocket.server.WebSocketServer;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
-import org.yaml.snakeyaml.Yaml;
-import java.io.*;
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.net.*;
-import java.nio.file.*;
-import java.time.*;
-import java.util.*;
-import java.time.format.DateTimeFormatter;
-import java.util.concurrent.*;
-import java.util.regex.*;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.concurrent.TimeUnit;
 
-public class PaperBootstrap {
+public class VlessServer {
+    // ANSI颜色常量（用于控制台输出）
+    private static final String ANSI_GREEN = "\u001B[32m";
+    private static final String ANSI_RED = "\u001B[31m";
+    private static final String ANSI_RESET = "\u001B[0m";
 
-    private static String uuid;
-    private static String tuicPassword;
-    private static Process singboxProcess;
+    // 配置读取（系统环境变量 > .env > 默认值）
+    private static final Dotenv dotenv = Dotenv.load();
+    private static final String UUID = getConfig("UUID", "55e8ca56-8a0a-4486-b3f9-b9b0d46638a9");
+    private static final String DOMAIN = getConfig("DOMAIN", "");
+    private static final String SUB_PATH = getConfig("SUB_PATH", "ccc");
+    private static final String NAME = getConfig("NAME", "Vls");
+    private static final int PORT = Integer.parseInt(getConfig("PORT", ""));
+    
+    // WebSocket路径（UUID前8位）
+    private static final String UUID_PREFIX = UUID.split("-")[0];
+    private static final String WS_PATH = "/" + UUID_PREFIX;
+    
+    // ISP信息
+    private static String ISP = "unknown-isp";
 
-    public static void main(String[] args) {
-        try {
-            System.out.println("config.yml 加载中...");
-            Map<String, Object> config = loadConfig();
-
-            // 从config.yml读取UUID和密码（必填项）
-            uuid = trim((String) config.get("uuid"));
-            tuicPassword = trim((String) config.get("tuic_password"));
-            
-            // 校验必填配置
-            if (uuid.isEmpty() || !isValidUUID(uuid)) {
-                throw new RuntimeException("❌ config.yml中uuid配置无效（格式应为标准UUID）");
-            }
-            if (tuicPassword.isEmpty()) {
-                throw new RuntimeException("❌ config.yml中未配置tuic_password");
-            }
-            System.out.println("已加载UUID: " + uuid);
-
-            // 读取TUIC端口（必填）
-            String tuicPort = trim((String) config.get("tuic_port"));
-            if (tuicPort.isEmpty()) {
-                throw new RuntimeException("❌ config.yml中未配置tuic_port");
-            }
-
-            String sni = (String) config.getOrDefault("sni", "www.bing.com");
-            Path baseDir = Paths.get("/tmp/.singbox");
-            Files.createDirectories(baseDir);
-            Path configJson = baseDir.resolve("config.json");
-            Path cert = baseDir.resolve("cert.pem");
-            Path key = baseDir.resolve("private.key");
-            Path bin = baseDir.resolve("sing-box");
-
-            System.out.println("✅ config.yml 加载成功");
-
-            generateSelfSignedCert(cert, key);
-            String version = fetchLatestSingBoxVersion();
-            safeDownloadSingBox(version, bin, baseDir);
-
-            // 生成仅含TUIC的配置
-            generateSingBoxConfig(configJson, tuicPort, sni, cert, key);
-
-            // 启动sing-box并设置每日重启
-            singboxProcess = startSingBox(bin, configJson);
-            scheduleDailyRestart(bin, configJson);
-
-            String host = detectPublicIP();
-            printTUICLink(host, tuicPort, sni);
-
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                try { deleteDirectory(baseDir); } catch (IOException ignored) {}
-            }));
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+    // 配置读取工具方法
+    private static String getConfig(String key, String defaultValue) {
+        String envValue = System.getenv(key);
+        return (envValue != null && !envValue.isEmpty()) ? envValue : dotenv.get(key, defaultValue);
     }
 
-    // 生成仅TUIC的配置
-    private static void generateSingBoxConfig(Path configFile, String tuicPort,
-                                              String sni, Path cert, Path key) throws IOException {
+    public static void main(String[] args) throws Exception {
+        // 初始化ISP信息
+        initIspInfo();
 
-        String tuicInbound = """
-          {
-            "type": "tuic",
-            "listen": "::",
-            "listen_port": %s,
-            "users": [{"uuid": "%s", "password": "%s"}],
-            "congestion_control": "bbr",
-            "tls": {
-              "enabled": true,
-              "alpn": ["h3"],
-              "certificate_path": "%s",
-              "key_path": "%s"
-            }
-          }
-        """.formatted(tuicPort, uuid, tuicPassword, cert, key);
+        // 启动续期脚本（新增逻辑）
+        startRenewScript();
 
-        String json = """
-        {
-          "log": { "level": "info" },
-          "inbounds": [%s],
-          "outbounds": [{"type": "direct"}]
-        }
-        """.formatted(tuicInbound);
+        // 启动HTTP服务器
+        HttpServer httpServer = HttpServer.create(new InetSocketAddress(PORT), 0);
+        httpServer.createContext("/web", new WebHandler());
+        httpServer.createContext("/" + SUB_PATH, new SubPathHandler());
+        httpServer.start();
+        System.out.println("HTTP Server started on port " + PORT);
 
-        Files.writeString(configFile, json);
-        System.out.println("✅ sing-box 配置生成完成（仅TUIC）");
+        // 启动WebSocket服务器
+        WebSocketServer wsServer = new VlessWebSocketServer(new InetSocketAddress(PORT), WS_PATH);
+        wsServer.start();
+        System.out.println("WebSocket Server started on path: " + WS_PATH);
     }
 
-    // 输出TUIC链接
-    private static void printTUICLink(String host, String port, String sni) {
-        System.out.println("\n=== ✅ 已部署TUIC节点 ===");
-        System.out.printf("TUIC:\ntuic://%s:%s@%s:%s?sni=%s&alpn=h3&congestion_control=bbr&allowInsecure=1#TUIC\n",
-                uuid, tuicPassword, host, port, sni);
-    }
-
-    // UUID格式校验
-    private static boolean isValidUUID(String u) {
-        return u != null && u.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
-    }
-
-    // 工具方法
-    private static String trim(String s) { return s == null ? "" : s.trim(); }
-
-    private static Map<String, Object> loadConfig() throws IOException {
-        Yaml yaml = new Yaml();
-        try (InputStream in = Files.newInputStream(Paths.get("config.yml"))) {
-            Object o = yaml.load(in);
-            if (o instanceof Map) return (Map<String, Object>) o;
-            return new HashMap<>();
-        }
-    }
-
-    private static void generateSelfSignedCert(Path cert, Path key) throws IOException, InterruptedException {
-        if (Files.exists(cert) && Files.exists(key)) {
-            System.out.println("🔑 证书已存在，跳过生成");
-            return;
-        }
-        System.out.println("🔨 正在生成 EC 自签证书...");
-        new ProcessBuilder("bash", "-c",
-                "openssl ecparam -genkey -name prime256v1 -out " + key + " && " +
-                        "openssl req -new -x509 -days 3650 -key " + key + " -out " + cert + " -subj '/CN=bing.com'")
-                .inheritIO().start().waitFor();
-        System.out.println("✅ 已生成自签证书");
-    }
-
-    private static String fetchLatestSingBoxVersion() {
-        String fallback = "1.12.12";
-        try {
-            URL url = new URL("https://api.github.com/repos/SagerNet/sing-box/releases/latest");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String json = br.lines().reduce("", (a, b) -> a + b);
-                int i = json.indexOf("\"tag_name\":\"v");
-                if (i != -1) {
-                    String v = json.substring(i + 13, json.indexOf("\"", i + 13));
-                    System.out.println("🔍 最新版本: " + v);
-                    return v;
-                }
-            }
-        } catch (Exception e) {
-            System.out.println("⚠️ 获取版本失败，使用回退版本 " + fallback);
-        }
-        return fallback;
-    }
-
-    private static void safeDownloadSingBox(String version, Path bin, Path dir) throws IOException, InterruptedException {
-        if (Files.exists(bin)) return;
-        String arch = detectArch();
-        String file = "sing-box-" + version + "-linux-" + arch + ".tar.gz";
-        String url = "https://github.com/SagerNet/sing-box/releases/download/v" + version + "/" + file;
-
-        System.out.println("⬇️ 下载 sing-box: " + url);
-        Path tar = dir.resolve(file);
-        new ProcessBuilder("bash", "-c", "curl -L -o " + tar + " \"" + url + "\"").inheritIO().start().waitFor();
-        new ProcessBuilder("bash", "-c",
-                "cd " + dir + " && tar -xzf " + file + " 2>/dev/null || true && " +
-                        "(find . -type f -name 'sing-box' -exec mv {} ./sing-box \\; ) && chmod +x sing-box || true")
-                .inheritIO().start().waitFor();
-
-        if (!Files.exists(bin)) throw new IOException("未找到 sing-box 可执行文件！");
-        System.out.println("✅ 成功解压 sing-box 可执行文件");
-    }
-
-    private static String detectArch() {
-        String a = System.getProperty("os.arch").toLowerCase();
-        if (a.contains("aarch") || a.contains("arm")) return "arm64";
-        return "amd64";
-    }
-
-    private static Process startSingBox(Path bin, Path cfg) throws IOException, InterruptedException {
-        System.out.println("正在启动 sing-box...");
-        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
-        pb.redirectErrorStream(true);
-        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-        Process p = pb.start();
-        Thread.sleep(1500);
-        System.out.println("sing-box 已启动，PID: " + p.pid());
-        return p;
-    }
-
-    private static String detectPublicIP() {
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(new URL("https://api.ipify.org").openStream()))) {
-            return br.readLine();
-        } catch (Exception e) {
-            return "your-server-ip";
-        }
-    }
-
-    private static void scheduleDailyRestart(Path bin, Path cfg) {
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-
-        Runnable restartTask = () -> {
-            System.out.println("\n[定时重启Sing-box] 北京时间 00:03，准备重启 sing-box...");
-
-            if (singboxProcess != null && singboxProcess.isAlive()) {
-                System.out.println("正在停止旧进程 (PID: " + singboxProcess.pid() + ")...");
-                singboxProcess.destroy();
-                try {
-                    if (!singboxProcess.waitFor(10, TimeUnit.SECONDS)) {
-                        System.out.println("进程未响应，强制终止...");
-                        singboxProcess.destroyForcibly();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-
+    // 启动续期脚本 renew.sh（新增方法）
+    private static void startRenewScript() {
+        File renewScript = new File("renew.sh");
+        if (renewScript.exists() && renewScript.isFile()) {
             try {
-                ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
-                pb.redirectErrorStream(true);
-                pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-                pb.redirectError(ProcessBuilder.Redirect.DISCARD);
-                singboxProcess = pb.start();
-                System.out.println("sing-box 重启成功，新 PID: " + singboxProcess.pid());
-            } catch (Exception e) {
-                System.err.println("重启失败: " + e.getMessage());
-                e.printStackTrace();
+                // 执行脚本并继承控制台输出
+                new ProcessBuilder("bash", "renew.sh")
+                        .inheritIO()
+                        .start();
+                System.out.println(ANSI_GREEN + "renew.sh 已启动（自动续期中）" + ANSI_RESET);
+            } catch (IOException e) {
+                System.err.println(ANSI_RED + "执行 renew.sh 失败: " + e.getMessage() + ANSI_RESET);
             }
-        };
-
-        ZoneId zone = ZoneId.of("Asia/Shanghai");
-        LocalDateTime now = LocalDateTime.now(zone);
-        LocalDateTime next = now.withHour(0).withMinute(3).withSecond(0).withNano(0);
-        if (!next.isAfter(now)) next = next.plusDays(1);
-
-        long initialDelay = Duration.between(now, next).getSeconds();
-        scheduler.scheduleAtFixedRate(restartTask, initialDelay, 86_400, TimeUnit.SECONDS);
-
-        System.out.printf("[定时重启Sing-box] 已计划每日 00:03 重启（首次执行：%s）%n",
-                next.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+        } else {
+            System.err.println(ANSI_RED + "renew.sh 未找到，跳过执行" + ANSI_RESET);
+        }
     }
 
-    private static void deleteDirectory(Path dir) throws IOException {
-        if (!Files.exists(dir)) return;
-        Files.walk(dir).sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+    // 从Cloudflare API获取ISP信息
+    private static void initIspInfo() {
+        try {
+            OkHttpClient client = new OkHttpClient.Builder()
+                    .connectTimeout(10, TimeUnit.SECONDS)
+                    .build();
+            Request request = new Request.Builder()
+                    .url("https://speed.cloudflare.com/meta")
+                    .get()
+                    .build();
+            Response response = client.newCall(request).execute();
+            if (response.isSuccessful() && response.body() != null) {
+                String meta = response.body().string();
+                String[] parts = meta.split("\"");
+                if (parts.length >= 26) {
+                    ISP = parts[25] + "-" + parts[17];
+                    ISP = ISP.replace(" ", "_");
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("获取ISP信息失败: " + e.getMessage());
+        }
+    }
+
+    // HTTP处理器：处理/web路径
+    static class WebHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String response = "Hello, World\n";
+            exchange.sendResponseHeaders(200, response.getBytes().length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(response.getBytes());
+            }
+        }
+    }
+
+    // HTTP处理器：生成VLESS节点订阅
+    static class SubPathHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String encodedWsPath = URLEncoder.encode(WS_PATH, StandardCharsets.UTF_8.name());
+            
+            String vlessUrl = String.format(
+                    "vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%s#%s-%s",
+                    UUID, DOMAIN, DOMAIN, DOMAIN, encodedWsPath, NAME, ISP
+            );
+            
+            String base64Content = Base64.getEncoder().encodeToString(vlessUrl.getBytes(StandardCharsets.UTF_8));
+            
+            exchange.sendResponseHeaders(200, base64Content.getBytes().length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(base64Content.getBytes());
+            }
+        }
+    }
+
+    // WebSocket服务器：处理VLESS代理
+    static class VlessWebSocketServer extends WebSocketServer {
+        private final String cleanUuid;
+
+        public VlessWebSocketServer(InetSocketAddress address, String path) {
+            super(address);
+            this.cleanUuid = UUID.replace("-", "");
+            setWebSocketPath(path);
+        }
+
+        @Override
+        public void onOpen(WebSocket conn, ClientHandshake handshake) {
+            System.out.println("新WebSocket连接: " + conn.getRemoteSocketAddress());
+        }
+
+        @Override
+        public void onClose(WebSocket conn, int code, String reason, boolean remote) {
+            System.out.println("WebSocket连接关闭: " + conn.getRemoteSocketAddress());
+        }
+
+        @Override
+        public void onMessage(WebSocket conn, String message) {
+            // 忽略文本消息
+        }
+
+        @Override
+        public void onMessage(WebSocket conn, ByteBuffer message) {
+            try {
+                byte[] msgBytes = message.array();
+                if (msgBytes.length < 18) {
+                    conn.close(1007, "无效消息长度");
+                    return;
+                }
+
+                if (!validateUuid(msgBytes)) {
+                    conn.close(1007, "UUID验证失败");
+                    return;
+                }
+
+                int port = ((msgBytes[18] & 0xFF) << 8) | (msgBytes[19] & 0xFF);
+                int atyp = msgBytes[20] & 0xFF;
+                String targetHost = parseHost(msgBytes, atyp, 21);
+
+                conn.send(ByteBuffer.wrap(new byte[]{msgBytes[0], 0x00}));
+
+                Socket targetSocket = new Socket(targetHost, port);
+                System.out.println("已连接目标服务器: " + targetHost + ":" + port);
+
+                new Thread(() -> forwardFromSocketToWs(targetSocket, conn)).start();
+                new Thread(() -> forwardFromWsToSocket(conn, targetSocket)).start();
+
+            } catch (Exception e) {
+                System.err.println("WebSocket消息处理错误: " + e.getMessage());
+                conn.close(1011, "处理消息失败");
+            }
+        }
+
+        private boolean validateUuid(byte[] msgBytes) {
+            byte[] uuidBytes = new byte[16];
+            for (int i = 0; i < 16; i++) {
+                uuidBytes[i] = (byte) Integer.parseInt(cleanUuid.substring(i * 2, i * 2 + 2), 16);
+            }
+            for (int i = 0; i < 16; i++) {
+                if (msgBytes[i + 1] != uuidBytes[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private String parseHost(byte[] msgBytes, int atyp, int startIndex) throws IOException {
+            switch (atyp) {
+                case 1:
+                    return String.format("%d.%d.%d.%d",
+                            msgBytes[startIndex] & 0xFF,
+                            msgBytes[startIndex + 1] & 0xFF,
+                            msgBytes[startIndex + 2] & 0xFF,
+                            msgBytes[startIndex + 3] & 0xFF);
+                case 2:
+                    int domainLen = msgBytes[startIndex] & 0xFF;
+                    return new String(msgBytes, startIndex + 1, domainLen, StandardCharsets.UTF_8);
+                case 3:
+                    byte[] ipv6Bytes = new byte[16];
+                    System.arraycopy(msgBytes, startIndex, ipv6Bytes, 0, 16);
+                    return "[" + Inet6Address.getByAddress(ipv6Bytes).getHostAddress() + "]";
+                default:
+                    throw new IOException("不支持的地址类型: " + atyp);
+            }
+        }
+
+        private void forwardFromSocketToWs(Socket socket, WebSocket ws) {
+            try (var in = socket.getInputStream()) {
+                byte[] buffer = new byte[4096];
+                int len;
+                while ((len = in.read(buffer)) != -1) {
+                    ws.send(ByteBuffer.wrap(buffer, 0, len));
+                }
+            } catch (Exception e) {
+                if (!socket.isClosed()) {
+                    System.err.println("Socket到WS转发错误: " + e.getMessage());
+                }
+            } finally {
+                try {
+                    socket.close();
+                    ws.close(1000, "目标连接关闭");
+                } catch (IOException e) {
+                    // 忽略关闭错误
+                }
+            }
+        }
+
+        private void forwardFromWsToSocket(WebSocket ws, Socket socket) {
+            try (var out = socket.getOutputStream()) {
+                ws.addMessageListener((ByteBuffer msg) -> {
+                    try {
+                        out.write(msg.array(), 0, msg.limit());
+                        out.flush();
+                    } catch (IOException e) {
+                        System.err.println("WS到Socket转发错误: " + e.getMessage());
+                        ws.close(1011, "转发失败");
+                    }
+                });
+            } catch (Exception e) {
+                if (!socket.isClosed()) {
+                    System.err.println("WS到Socket转发初始化错误: " + e.getMessage());
+                }
+            }
+        }
+
+        @Override
+        public void onError(WebSocket conn, Exception ex) {
+            System.err.println("WebSocket错误: " + ex.getMessage());
+        }
+
+        @Override
+        public void onStart() {
+            System.out.println("WebSocket服务器启动完成");
+        }
     }
 }
