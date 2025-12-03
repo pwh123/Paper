@@ -14,19 +14,19 @@ dependencies {
     // YAML解析库
     implementation("org.yaml:snakeyaml:2.3")
     
-    // Java WebSocket API规范（编译时依赖）
+    // Java WebSocket API规范
     implementation("javax.websocket:javax.websocket-api:1.1")
     
     // Jetty服务器核心
     implementation("org.eclipse.jetty:jetty-server:9.4.44.v20210927")
     
-    // Jetty Servlet支持（WebSocket依赖）
+    // Jetty Servlet支持
     implementation("org.eclipse.jetty:jetty-servlet:9.4.44.v20210927")
     
     // Jetty WebSocket服务器实现
     implementation("org.eclipse.jetty.websocket:websocket-server:9.4.44.v20210927")
     
-    // Jetty WebSocket Servlet集成
+    // Jetty WebSocket与Servlet集成
     implementation("org.eclipse.jetty.websocket:websocket-servlet:9.4.44.v20210927")
 }
 
@@ -37,7 +37,7 @@ java {
 }
 
 tasks {
-    // 确保主类写入Manifest
+    // 生成可执行jar（包含主类信息）
     jar {
         manifest {
             attributes["Main-Class"] = "io.papermc.paper.PaperBootstrap"
@@ -45,9 +45,9 @@ tasks {
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     }
 
-    // 创建fatJar（包含所有依赖，可独立运行）
+    // 生成fatJar（包含所有依赖，可独立运行）
     val fatJar by registering(com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar::class) {
-        archiveBaseName.set("server")
+        archiveBaseName.set("vless-ws-server")
         archiveClassifier.set("")
         archiveVersion.set("")
         manifest {
