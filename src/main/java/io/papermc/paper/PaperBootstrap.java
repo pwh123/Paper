@@ -1,110 +1,89 @@
-import java.io.*;
-import java.net.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+package io.papermc.paper;
+
 import java.util.*;
-import java.util.Base64;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.net.*;
+import java.io.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
 
-public class V2RayProxy {
+public class PaperBootstrap {
 
-    // 配置参数（从环境变量读取或使用默认值）
-    private static final String UUID = System.getenv("UUID") != null ? System.getenv("UUID") : "55e8ca56-8a0a-4486-b3f9-b9b0d46638a9";
-    private static final String DOMAIN = System.getenv("DOMAIN") != null ? System.getenv("DOMAIN") : "";
-    private static final String SUB_PATH = System.getenv("SUB_PATH") != null ? System.getenv("SUB_PATH") : "ccc";
-    private static final String NAME = System.getenv("NAME") != null ? System.getenv("NAME") : "Vls";
-    private static final int PORT = System.getenv("PORT") != null ? Integer.parseInt(System.getenv("PORT")) : ;
+    private static final String DEFAULT_PORT = "8080"; // 非加密建议用80/8080
+    private static String uuid;
+    private static String port;
+    private static String wsPath;
+    private static String host;
 
-    // 获取ISP信息（模拟）
-    private static String getISP() {
-        return "Unknown-ISP";
-    }
-
-    public static void main(String[] args) throws IOException {
-        HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
-        server.createContext("/web", exchange -> {
-            if ("GET".equals(exchange.getRequestMethod())) {
-                String response = "Hello, World\n";
-                exchange.sendResponseHeaders(200, response.getBytes(StandardCharsets.UTF_8).length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(response.getBytes(StandardCharsets.UTF_8));
-                }
-            } else {
-                exchange.sendResponseHeaders(405, -1);
-            }
-            exchange.close();
-        });
-
-        server.createContext("/" + SUB_PATH, exchange -> {
-            if ("GET".equals(exchange.getRequestMethod())) {
-                String vlessURL = String.format(
-                        "vless://%s@www.visa.com.tw:443?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=/%s#%s-%s",
-                        UUID, DOMAIN, DOMAIN, SUB_PATH, NAME, getISP()
-                );
-                String base64Content = Base64.getEncoder().encodeToString(vlessURL.getBytes(StandardCharsets.UTF_8));
-                exchange.sendResponseHeaders(200, base64Content.getBytes(StandardCharsets.UTF_8).length + 1);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(base64Content.getBytes(StandardCharsets.UTF_8));
-                    os.write('\n');
-                }
-            } else {
-                exchange.sendResponseHeaders(405, -1);
-            }
-            exchange.close();
-        });
-
-        // WebSocket处理（简化版，实际需用Netty等库实现完整协议）
-        server.createContext("/ws", exchange -> {
-            if ("GET".equals(exchange.getRequestMethod()) && "websocket".equals(exchange.getRequestHeaders().getFirst("Upgrade"))) {
-                // 这里仅示意，实际WebSocket需用第三方库如Tyrus或Netty
-                exchange.sendResponseHeaders(426, -1); // 需要Netty等支持
-                exchange.close();
-            } else {
-                exchange.sendResponseHeaders(404, -1);
-                exchange.close();
-            }
-        });
-
-        server.setExecutor(Executors.newCachedThreadPool());
-        server.start();
-        System.out.println("Server is running on port " + PORT);
-    }
-}
-parsePort(String s) {
-        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return 8080; }
-    }
-
-    static byte[] parseUuidHex(String uuid) {
-        String hex = uuid.replace("-", "").toLowerCase();
-        byte[] out = new byte[16];
-        for (int i = 0; i < 16; i++) {
-            int pos = i * 2;
-            out[i] = (byte) Integer.parseInt(hex.substring(pos, pos + 2), 16);
-        }
-        return out; // 补充缺失的闭合括号
-    }
-
-    // 获取ISP信息（通过Cloudflare API）
-    static String fetchIsp() {
+    public static void main(String[] args) {
         try {
-            HttpClient client = HttpClient.newHttpClient();
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create("https://speed.cloudflare.com/meta"))
-                    .timeout(10, TimeUnit.SECONDS)
-                    .build();
+            // 从环境变量或输入获取配置（简化版，无需文件）
+            uuid = getConfig("UUID", "请输入UUID（必填）: ");
+            port = getConfig("PORT", DEFAULT_PORT, "请输入端口（默认" + DEFAULT_PORT + "）: ");
+            wsPath = getConfig("WS_PATH", "/" + uuid.split("-")[0], "请输入WebSocket路径（默认/" + uuid.split("-")[0] + "）: ");
+            host = getConfig("HOST", "example.com", "请输入主机名（默认example.com）: ");
 
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                String[] parts = response.body().split("\"");
-                if (parts.length >= 26) {
-                    return parts[25] + "-" + parts[17].replace(" ", "_");
-                }
+            // 校验UUID格式
+            if (!isValidUUID(uuid)) {
+                throw new RuntimeException("UUID格式错误（应为8-4-4-4-12位）");
             }
+
+            // 输出节点信息
+            System.out.println("\n=== VLESS-WS 节点配置（无TLS） ===");
+            printVlessLink(host, port, wsPath);
+
+            // 模拟启动提示（无需下载程序）
+            System.out.println("\n[提示] 无需证书和额外程序，可直接使用上述链接配置客户端");
+            System.out.println("WebSocket配置要点：");
+            System.out.println("- 传输协议：ws（非加密）");
+            System.out.println("- 路径：" + wsPath);
+            System.out.println("- 主机头：" + host);
+
         } catch (Exception e) {
-            System.err.println("获取ISP信息失败: " + e.getMessage());
+            System.err.println("错误：" + e.getMessage());
         }
-        return "unknown-isp";
+    }
+
+    // 获取配置（优先环境变量，无则手动输入）
+    private static String getConfig(String envKey, String prompt) {
+        String value = System.getenv(envKey);
+        if (value == null || value.trim().isEmpty()) {
+            System.out.print(prompt);
+            try {
+                return new Scanner(System.in).nextLine().trim();
+            } catch (Exception e) {
+                return "";
+            }
+        }
+        return value.trim();
+    }
+
+    private static String getConfig(String envKey, String defaultValue, String prompt) {
+        String value = System.getenv(envKey);
+        if (value == null || value.trim().isEmpty()) {
+            System.out.print(prompt);
+            try {
+                value = new Scanner(System.in).nextLine().trim();
+                return value.isEmpty() ? defaultValue : value;
+            } catch (Exception e) {
+                return defaultValue;
+            }
+        }
+        return value.trim();
+    }
+
+    // 输出VLESS链接（无TLS）
+    private static void printVlessLink(String host, String port, String wsPath) {
+        // 无TLS时security=none，无需证书相关配置
+        String vlessLink = String.format(
+            "vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#VLESS-WS(无加密)",
+            uuid, host, port, host, wsPath
+        );
+        System.out.println("节点链接：");
+        System.out.println(vlessLink);
+    }
+
+    // UUID格式校验
+    private static boolean isValidUUID(String u) {
+        return u.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
     }
 }
