@@ -1,141 +1,239 @@
 package io.papermc.paper;
 
 import org.yaml.snakeyaml.Yaml;
-import java.util.*;
-import java.net.*;
+import javax.websocket.*;
+import javax.websocket.server.ServerEndpoint;
+import javax.websocket.server.ServerContainer;
 import java.io.*;
-import java.time.*;
-import java.time.format.DateTimeFormatter;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.regex.Pattern;
 
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.servlet.*;
+import org.eclipse.jetty.websocket.servlet.*;
+
+@ServerEndpoint("/{wsPath}") // WebSocket端点，动态路径
 public class PaperBootstrap {
-
-    private static final String DEFAULT_PORT = "8080";
-    private static final String DEFAULT_HOST = "example.com";
+    // 配置参数
     private static String uuid;
-    private static String port;
+    private static int port;
     private static String wsPath;
     private static String host;
+    private static final ExecutorService executor = Executors.newCachedThreadPool();
 
-    public static void main(String[] args) {
+    // 主方法：启动WebSocket服务器
+    public static void main(String[] args) throws Exception {
+        // 加载配置
+        loadConfig();
+
+        // 启动Jetty服务器（提供WebSocket支持）
+        Server server = new Server(port);
+        ServletContextHandler context = new ServletContextHandler(ServletContextHandler.SESSIONS);
+        context.setContextPath("/");
+        server.setHandler(context);
+
+        // 配置WebSocket
+        WebSocketServletRegistration registration = context.addServlet(WebSocketServlet.class, "/" + wsPath);
+        registration.setInitParameter("javax.websocket.server.ServerContainer", 
+            "io.papermc.paper.PaperBootstrap");
+
+        // 启动服务
+        server.start();
+        System.out.println("✅ VLESS-WS节点已部署");
+        System.out.println("地址：ws://" + host + ":" + port + "/" + wsPath);
+        System.out.println("VLESS链接：" + generateVlessLink());
+        server.join();
+    }
+
+    // 加载配置（从config.yml、环境变量或默认值）
+    private static void loadConfig() {
         try {
-            // 1. 优先从config.yml读取配置
-            loadConfigFromYml();
+            // 1. 从config.yml读取
+            Map<String, String> config = loadFromYml();
+            // 2. 环境变量补充
+            uuid = getConfig(config, "uuid", System.getenv("UUID"), "请输入UUID（必填）: ");
+            port = Integer.parseInt(getConfig(config, "port", System.getenv("PORT"), "8080", "请输入端口（默认8080）: "));
+            wsPath = getConfig(config, "wsPath", System.getenv("WS_PATH"), "/" + uuid.split("-")[0], "请输入WS路径: ");
+            host = getConfig(config, "host", System.getenv("HOST"), "0.0.0.0", "请输入主机名: ");
 
-            // 2. 若config.yml未配置，从环境变量获取
-            loadConfigFromEnv();
-
-            // 3. 若仍未配置，从控制台输入获取
-            loadConfigFromConsole();
-
-            // 4. 校验UUID格式
+            // 校验UUID
             if (!isValidUUID(uuid)) {
-                throw new RuntimeException("UUID格式错误（应为8-4-4-4-12位，如：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）");
+                throw new RuntimeException("UUID格式错误");
             }
-
-            // 5. 输出节点信息
-            System.out.println("\n=== VLESS-WS 节点配置（无TLS） ===");
-            printVlessLink(host, port, wsPath);
-
-            // 6. 输出配置要点
-            System.out.println("\n[提示] 无需证书和额外程序，可直接使用上述链接配置客户端");
-            System.out.println("WebSocket配置要点：");
-            System.out.println("- 传输协议：ws（非加密）");
-            System.out.println("- 路径：" + wsPath);
-            System.out.println("- 主机头：" + host);
-
         } catch (Exception e) {
-            System.err.println("错误：" + e.getMessage());
+            System.err.println("配置错误：" + e.getMessage());
+            System.exit(1);
         }
     }
 
-    // 从config.yml读取配置
-    private static void loadConfigFromYml() {
-        Yaml yaml = new Yaml();
-        try (InputStream in = new FileInputStream("config.yml")) {
-            Map<String, String> config = yaml.load(in);
-            if (config != null) {
-                uuid = config.get("uuid");
-                port = config.get("port");
-                wsPath = config.get("wsPath");
-                host = config.get("host");
-                System.out.println("已从config.yml加载配置");
+    // WebSocket连接建立时触发
+    @OnOpen
+    public void onOpen(Session session, EndpointConfig config) {
+        System.out.println("新连接：" + session.getId());
+    }
+
+    // 接收客户端数据（核心：转发到目标服务器）
+    @OnMessage
+    public void onMessage(Session session, ByteBuffer buffer) {
+        executor.submit(() -> {
+            try {
+                // 解析VLESS协议头部（简化版）
+                byte[] data = new byte[buffer.remaining()];
+                buffer.get(data);
+                if (!verifyUuid(data)) {
+                    session.close(new CloseReason(CloseReason.CloseCodes.POLICY_VIOLATION, "UUID错误"));
+                    return;
+                }
+
+                // 解析目标地址和端口（VLESS协议格式）
+                String targetHost = parseHost(data);
+                int targetPort = parsePort(data);
+
+                // 建立到目标服务器的TCP连接
+                SocketChannel targetChannel = SocketChannel.open(new InetSocketAddress(targetHost, targetPort));
+                targetChannel.configureBlocking(false);
+
+                // 转发数据：客户端→目标服务器
+                executor.submit(() -> forward(session, targetChannel));
+                // 转发数据：目标服务器→客户端
+                executor.submit(() -> forward(targetChannel, session));
+
+            } catch (Exception e) {
+                try { session.close(); } catch (Exception ignored) {}
             }
-        } catch (FileNotFoundException e) {
-            System.out.println("未找到config.yml，将尝试其他方式获取配置");
+        });
+    }
+
+    // 连接关闭时清理资源
+    @OnClose
+    public void onClose(Session session) {
+        System.out.println("连接关闭：" + session.getId());
+    }
+
+    // 数据转发：WebSocket→目标服务器
+    private void forward(Session session, SocketChannel targetChannel) {
+        try {
+            ByteBuffer buffer = ByteBuffer.allocate(8192);
+            while (session.isOpen() && targetChannel.isOpen()) {
+                // 读取客户端数据并转发
+                if (session.getBasicRemote().recv(buffer) > 0) {
+                    buffer.flip();
+                    targetChannel.write(buffer);
+                    buffer.clear();
+                }
+            }
         } catch (Exception e) {
-            System.err.println("读取config.yml失败：" + e.getMessage());
+            close(session, targetChannel);
         }
     }
 
-    // 从环境变量读取配置（补充config.yml未配置的项）
-    private static void loadConfigFromEnv() {
-        if (uuid == null || uuid.trim().isEmpty()) {
-            uuid = System.getenv("UUID");
-        }
-        if (port == null || port.trim().isEmpty()) {
-            port = System.getenv("PORT");
-        }
-        if (wsPath == null || wsPath.trim().isEmpty()) {
-            wsPath = System.getenv("WS_PATH");
-        }
-        if (host == null || host.trim().isEmpty()) {
-            host = System.getenv("HOST");
+    // 数据转发：目标服务器→WebSocket客户端
+    private void forward(SocketChannel targetChannel, Session session) {
+        try {
+            ByteBuffer buffer = ByteBuffer.allocate(8192);
+            while (session.isOpen() && targetChannel.isOpen()) {
+                // 读取目标服务器数据并转发给客户端
+                if (targetChannel.read(buffer) > 0) {
+                    buffer.flip();
+                    session.getBasicRemote().sendBinary(buffer);
+                    buffer.clear();
+                }
+            }
+        } catch (Exception e) {
+            close(session, targetChannel);
         }
     }
 
-    // 从控制台输入获取配置（补充未配置的项）
-    private static void loadConfigFromConsole() {
-        Scanner scanner = new Scanner(System.in);
-
-        // 获取UUID（必填）
-        while (uuid == null || uuid.trim().isEmpty()) {
-            System.out.print("请输入UUID（必填）: ");
-            uuid = scanner.nextLine().trim();
-        }
-
-        // 获取端口（默认8080）
-        if (port == null || port.trim().isEmpty()) {
-            System.out.print("请输入端口（默认" + DEFAULT_PORT + "）: ");
-            port = scanner.nextLine().trim();
-            if (port.isEmpty()) {
-                port = DEFAULT_PORT;
-            }
-        }
-
-        // 获取WebSocket路径（默认UUID前8位）
-        if (wsPath == null || wsPath.trim().isEmpty()) {
-            String defaultWsPath = "/" + uuid.split("-")[0];
-            System.out.print("请输入WebSocket路径（默认" + defaultWsPath + "）: ");
-            wsPath = scanner.nextLine().trim();
-            if (wsPath.isEmpty()) {
-                wsPath = defaultWsPath;
-            }
-        }
-
-        // 获取主机名（默认example.com）
-        if (host == null || host.trim().isEmpty()) {
-            System.out.print("请输入主机名（默认" + DEFAULT_HOST + "）: ");
-            host = scanner.nextLine().trim();
-            if (host.isEmpty()) {
-                host = DEFAULT_HOST;
-            }
-        }
-
-        scanner.close();
+    // 关闭连接
+    private void close(Session session, SocketChannel channel) {
+        try { session.close(); } catch (Exception ignored) {}
+        try { channel.close(); } catch (Exception ignored) {}
     }
 
-    // 输出VLESS链接（无TLS）
-    private static void printVlessLink(String host, String port, String wsPath) {
-        String vlessLink = String.format(
-            "vless://%s@%s:%s?encryption=none&security=none&type=ws&host=%s&path=%s#VLESS-WS(无加密)",
+    // 生成VLESS链接
+    private static String generateVlessLink() {
+        return String.format(
+            "vless://%s@%s:%d?encryption=none&security=none&type=ws&host=%s&path=%s#VLESS-WS",
             uuid, host, port, host, wsPath
         );
-        System.out.println("节点链接：");
-        System.out.println(vlessLink);
     }
 
-    // UUID格式校验
-    private static boolean isValidUUID(String u) {
-        return u.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+    // 校验UUID（VLESS协议头部）
+    private boolean verifyUuid(byte[] data) {
+        if (data.length < 17) return false;
+        byte[] receivedUuid = Arrays.copyOfRange(data, 1, 17);
+        byte[] expectedUuid = uuidToBytes(uuid);
+        return Arrays.equals(receivedUuid, expectedUuid);
+    }
+
+    // UUID转字节数组
+    private byte[] uuidToBytes(String uuid) {
+        String hex = uuid.replace("-", "");
+        byte[] bytes = new byte[16];
+        for (int i = 0; i < 16; i++) {
+            bytes[i] = (byte) Integer.parseInt(hex.substring(i*2, i*2+2), 16);
+        }
+        return bytes;
+    }
+
+    // 解析目标主机（简化版VLESS协议）
+    private String parseHost(byte[] data) {
+        // 实际应根据VLESS协议规范解析，这里简化处理
+        return "example.com"; // 实际场景需从data中解析
+    }
+
+    // 解析目标端口
+    private int parsePort(byte[] data) {
+        // 实际应根据VLESS协议规范解析
+        return 80;
+    }
+
+    // 工具方法：读取配置
+    private static String getConfig(Map<String, String> config, String key, String envVal, String prompt) {
+        String val = config.getOrDefault(key, envVal);
+        if (val == null || val.trim().isEmpty()) {
+            System.out.print(prompt);
+            val = new Scanner(System.in).nextLine().trim();
+        }
+        return val;
+    }
+
+    private static String getConfig(Map<String, String> config, String key, String envVal, String defVal, String prompt) {
+        String val = config.getOrDefault(key, envVal);
+        if (val == null || val.trim().isEmpty()) {
+            System.out.print(prompt);
+            val = new Scanner(System.in).nextLine().trim();
+            if (val.isEmpty()) val = defVal;
+        }
+        return val;
+    }
+
+    // 从YAML读取配置
+    private static Map<String, String> loadFromYml() {
+        try (InputStream in = new FileInputStream("config.yml")) {
+            return new Yaml().load(in);
+        } catch (FileNotFoundException e) {
+            return new HashMap<>(); // 无文件则返回空
+        } catch (Exception e) {
+            System.err.println("读取config.yml失败，使用默认配置");
+            return new HashMap<>();
+        }
+    }
+
+    // UUID校验
+    private static boolean isValidUUID(String uuid) {
+        return uuid.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+    }
+
+    // WebSocketServlet：绑定端点
+    public static class WebSocketServlet extends javax.websocket.server.ServerEndpointConfig.Configurator {
+        @Override
+        public <T> T getEndpointInstance(Class<T> clazz) {
+            return (T) new PaperBootstrap();
+        }
     }
 }
